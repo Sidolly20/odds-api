@@ -19,13 +19,13 @@ const BASE_URL = 'https://api.football-data.org/v4';
 // codes here later (PL = Premier League, PD = La Liga, etc.)
 const COMPETITIONS = ['PL', 'PD', 'SA', 'BL1', 'CL'];
 
-async function fetchCompetitionMatches(code) {
-  const res = await fetch(`${BASE_URL}/competitions/${code}/matches?status=SCHEDULED`, {
+async function fetchCompetitionMatches(code, status) {
+  const res = await fetch(`${BASE_URL}/competitions/${code}/matches?status=${status}`, {
     headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY }
   });
 
   if (!res.ok) {
-    console.error(`Failed to fetch ${code}: ${res.status} ${res.statusText}`);
+    console.error(`Failed to fetch ${code} (${status}): ${res.status} ${res.statusText}`);
     return [];
   }
 
@@ -51,24 +51,34 @@ async function fetchAndStoreFixtures() {
   console.log('Starting fixture fetch...');
   let totalSaved = 0;
 
+  // Two passes per competition: upcoming (SCHEDULED/TIMED) AND recent results
+  // (FINISHED). Finished matches are what the prediction engine learns from —
+  // without real results, there's no history to calculate form or probability.
+  const statusesToFetch = ['SCHEDULED', 'FINISHED'];
+
   for (const code of COMPETITIONS) {
-    const matches = await fetchCompetitionMatches(code);
-    if (matches.length === 0) continue;
+    for (const status of statusesToFetch) {
+      const matches = await fetchCompetitionMatches(code, status);
+      if (matches.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        continue;
+      }
 
-    const rows = matches.map(mapMatchToRow);
+      const rows = matches.map(mapMatchToRow);
 
-    // upsert = insert new rows, update existing ones (matched by id)
-    const { error } = await supabase.from('fixtures').upsert(rows, { onConflict: 'id' });
+      // upsert = insert new rows, update existing ones (matched by id)
+      const { error } = await supabase.from('fixtures').upsert(rows, { onConflict: 'id' });
 
-    if (error) {
-      console.error(`Error saving ${code} fixtures:`, error.message);
-    } else {
-      totalSaved += rows.length;
-      console.log(`Saved ${rows.length} fixtures for ${code}`);
+      if (error) {
+        console.error(`Error saving ${code} (${status}):`, error.message);
+      } else {
+        totalSaved += rows.length;
+        console.log(`Saved ${rows.length} ${status} matches for ${code}`);
+      }
+
+      // Small delay between calls to be gentle on the free rate limit
+      await new Promise((resolve) => setTimeout(resolve, 1500));
     }
-
-    // Small delay between competitions to be gentle on the free rate limit
-    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 
   console.log(`Fixture fetch complete. Total saved: ${totalSaved}`);
