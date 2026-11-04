@@ -20,7 +20,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const nameOf = (v) => (typeof v === 'string' ? v : v?.name ?? null);
 const idOf = (v) => (v && typeof v === 'object' ? v.id ?? null : null);
 
-function mapEvent(e, odds) {
+function mapEvent(e, odds, leagueNames) {
   const homeId = e.home_team_id ?? idOf(e.home_team) ?? idOf(e.home);
   const awayId = e.away_team_id ?? idOf(e.away_team) ?? idOf(e.away);
   const leagueId = e.league_id ?? idOf(e.league) ?? idOf(e.competition) ?? idOf(e.tournament);
@@ -31,7 +31,7 @@ function mapEvent(e, odds) {
       id: leagueId ?? null,
       name:
         e.league_name ?? nameOf(e.league) ?? e.competition_name ?? nameOf(e.competition) ??
-        e.tournament_name ?? nameOf(e.tournament) ?? null,
+        e.tournament_name ?? nameOf(e.tournament) ?? leagueNames.get(leagueId) ?? null,
       logo: leagueLogo(leagueId)
     },
     home: {
@@ -95,19 +95,98 @@ async function oddsFor(ids) {
   return out;
 }
 
-// Dates are handled in UTC, as YYYY-MM-DD.
+// ---------- league names (loaded once a day) ----------
+// Bzzoiro's match list only carries a league id, so names come from /leagues/.
+let leagueSample = null;
+async function getLeagueNames() {
+  const names = new Map();
+  try {
+    for (let page = 0; page < 5; page++) {
+      const { data } = await bzzGet(`/leagues/?limit=200&offset=${page * 200}`, 86400);
+      const list = Array.isArray(data) ? data : (data.results ?? data.leagues ?? []);
+      if (page === 0 && list[0]) leagueSample = list[0];
+      for (const l of list) {
+        const name = l.name ?? l.league_name ?? l.title ?? null;
+        if (l.id != null && name) names.set(l.id, name);
+      }
+      if (list.length < 200) break;
+    }
+  } catch (err) {
+    console.error('League names error:', err.message);
+  }
+  return names;
+}
+
+// ---------- dates (UTC, YYYY-MM-DD) ----------
 const today = () => new Date().toISOString().slice(0, 10);
 const addDays = (ymd, n) => {
   const d = new Date(`${ymd}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 };
-const kickoffOf = (e) => e.event_date ?? e.kickoff ?? e.start_time ?? null;
+const kickoffOf = (e) => String(e.event_date ?? e.kickoff ?? e.start_time ?? '');
+const listOf = (data) => (Array.isArray(data) ? data : (data.results ?? data.events ?? []));
+
+// Walk the window from the SOONEST match onward, keeping only matches that
+// have not started, until we have enough. Works whether Bzzoiro lists the
+// window oldest-first or newest-first.
+async function collectUpcoming(base, needed, keepAll) {
+  const PAGE = 200;
+  const MAX_PAGES = 4;
+  const pathFor = (off, lim) => {
+    const p = new URLSearchParams(base);
+    p.set('limit', String(lim));
+    p.set('offset', String(off));
+    p.sort();
+    return `/events/?${p.toString()}`;
+  };
+
+  const first = await bzzGet(pathFor(0, PAGE), 60);
+  let stale = first.stale;
+  const total = first.data.count ?? listOf(first.data).length;
+  const firstList = listOf(first.data);
+  const newestFirst =
+    firstList.length > 1 && kickoffOf(firstList[0]) > kickoffOf(firstList[firstList.length - 1]);
+
+  const keep = (e) => keepAll || e.status === 'notstarted';
+  const kept = [];
+  let exhausted = false;
+
+  for (let k = 0; k < MAX_PAGES && kept.length < needed; k++) {
+    let off;
+    let len;
+    if (newestFirst) {
+      const upper = total - PAGE * k; // rows not yet read, counted from the soonest end
+      if (upper <= 0) { exhausted = true; break; }
+      off = Math.max(0, upper - PAGE);
+      len = upper - off;
+    } else {
+      off = PAGE * k;
+      len = Math.min(PAGE, total - off);
+      if (len <= 0) { exhausted = true; break; }
+    }
+
+    let list;
+    if (!newestFirst && k === 0) {
+      list = firstList;
+    } else {
+      const r = await bzzGet(pathFor(off, len), 60);
+      stale = stale || r.stale;
+      list = listOf(r.data);
+    }
+    list = [...list].sort((a, b) => kickoffOf(a).localeCompare(kickoffOf(b)));
+    for (const e of list) if (keep(e)) kept.push(e);
+    if (off === 0 || (!newestFirst && off + len >= total)) exhausted = true;
+  }
+
+  return { kept, stale, exhausted };
+}
 
 // GET /v1/matches
-// Default window: today through the next 7 days, soonest first.
-// Optional: league_id, date_from, date_to (YYYY-MM-DD), team_name, limit (max 20), offset
-//           debug=1 adds one raw match from Bzzoiro (to check field names)
+// Matches that have not started yet, today + the next 7 days by default, soonest first.
+// Optional: league_id, date_from, date_to (YYYY-MM-DD), team_name, limit (max 20), offset,
+//           include_started=1 (also show finished / cancelled / in-play),
+//           debug=1 (adds one raw match and one raw league, to check field names)
 router.get('/', async (req, res) => {
   const base = new URLSearchParams();
   base.set('status', 'upcoming');
@@ -131,50 +210,31 @@ router.get('/', async (req, res) => {
   if (req.query.team_name) base.set('team_name', String(req.query.team_name).slice(0, 60));
 
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 20);
-  const offset = Math.max(parseInt(req.query.offset) || 0, 0);
-
-  const pathFor = (off, lim) => {
-    const p = new URLSearchParams(base);
-    p.set('limit', String(lim));
-    p.set('offset', String(off));
-    p.sort();
-    return `/events/?${p.toString()}`;
-  };
-  const listOf = (data) => (Array.isArray(data) ? data : (data.results ?? data.events ?? []));
+  const offset = Math.min(Math.max(parseInt(req.query.offset) || 0, 0), 200);
+  const keepAll = req.query.include_started === '1';
 
   try {
-    let { data, stale } = await bzzGet(pathFor(offset, limit), 60);
-    let list = listOf(data);
-    const total = data.count ?? list.length;
+    const { kept, stale, exhausted } = await collectUpcoming(base, offset + limit + 1, keepAll);
+    const page = kept.slice(offset, offset + limit);
+    const hasMore = kept.length > offset + limit || !exhausted;
 
-    // Bzzoiro may return the LATEST matches first. We want the SOONEST first,
-    // so if the page comes back newest-first, fetch the other end instead.
-    const newestFirst =
-      list.length > 1 && String(kickoffOf(list[0])) > String(kickoffOf(list[list.length - 1]));
-    if (newestFirst && total > limit) {
-      const start = Math.max(0, total - offset - limit);
-      const len = Math.min(limit, total - offset);
-      if (len > 0) {
-        const second = await bzzGet(pathFor(start, len), 60);
-        list = listOf(second.data);
-        stale = stale || second.stale;
-      } else {
-        list = [];
-      }
-    }
-    list = [...list].sort((a, b) => String(kickoffOf(a)).localeCompare(String(kickoffOf(b))));
-
-    const oddsMap = await oddsFor(list.map((e) => e.id).filter(Boolean));
+    const [oddsMap, leagueNames] = await Promise.all([
+      oddsFor(page.map((e) => e.id).filter(Boolean)),
+      getLeagueNames()
+    ]);
 
     const body = {
-      count: total,
       window: { from: dateFrom, to: dateTo },
       limit,
       offset,
+      has_more: hasMore,
       stale,
-      matches: list.map((e) => mapEvent(e, oddsMap.get(e.id)))
+      matches: page.map((e) => mapEvent(e, oddsMap.get(e.id), leagueNames))
     };
-    if (req.query.debug === '1' && list[0]) body.raw_first_event = list[0];
+    if (req.query.debug === '1') {
+      body.raw_first_event = page[0] || null;
+      body.raw_first_league = leagueSample;
+    }
     res.json(body);
   } catch (err) {
     if (err instanceof UpstreamError && err.status === 400) {
