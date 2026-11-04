@@ -22,7 +22,7 @@ router.get('/', async (req, res) => {
 });
 
 // GET /v1/standings/league/98 — table for ANY Bzzoiro league (current season)
-// Optional: ?season_id=1635 to pick another season.
+// Optional: ?season_id=2037 to pick another season.
 router.get('/league/:id', async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
@@ -31,26 +31,31 @@ router.get('/league/:id', async (req, res) => {
 
   try {
     let seasonId = req.query.season_id ? parseInt(req.query.season_id, 10) : null;
-    let seasonName = null;
 
+    // Try to find the current season. If we cannot, ask for the table without it.
     if (!seasonId) {
-      const s = await bzzGet(`/leagues/${id}/season/`, 1800);
-      seasonId = s.data && s.data.id;
-      seasonName = s.data && s.data.name;
+      try {
+        const s = await bzzGet(`/leagues/${id}/season/`, 1800);
+        const d = s.data || {};
+        console.log('season lookup, league', id, 'keys:', Object.keys(d));
+        if (Number.isInteger(d.id)) seasonId = d.id;
+      } catch (e) {
+        console.log('season lookup failed, league', id, 'status:', e.status);
+      }
     }
 
-    if (!Number.isInteger(seasonId)) {
-      return res.status(502).json({ error: 'Could not work out the current season for this league.' });
-    }
+    const path = seasonId
+      ? `/leagues/${id}/standings/?season_id=${seasonId}`
+      : `/leagues/${id}/standings/`;
 
-    const t = await bzzGet(`/leagues/${id}/standings/?season_id=${seasonId}`, 600);
+    const t = await bzzGet(path, 600);
+    const body = t.data || {};
 
     res.json({
       league_id: id,
-      season_id: seasonId,
-      season: seasonName,
+      season_id: seasonId || (body.season && body.season.id) || null,
       stale: t.stale,
-      ...t.data
+      ...body
     });
   } catch (err) {
     if (err.status === 404) {
