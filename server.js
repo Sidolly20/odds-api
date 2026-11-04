@@ -1,5 +1,5 @@
 // server.js — odds-api
-// Fixtures + predictions + standings (from our database) and live scores (cached).
+// Fixtures + predictions + standings (from our database); live scores and odds (cached).
 
 require('dotenv').config();
 require('./lib/fixDns'); // fixes "fetch failed" on some Windows/ISP networks
@@ -9,6 +9,7 @@ const fixturesRouter = require('./routes/fixtures');
 const predictRouter = require('./routes/predict');
 const standingsRouter = require('./routes/standings');
 const liveRouter = require('./routes/live');
+const oddsRouter = require('./routes/odds');
 const fetchAndStoreFixtures = require('./jobs/fetchFixtures');
 const fetchAndStoreStandings = require('./jobs/fetchStandings');
 const apiKeyAuth = require('./lib/apiKeyAuth');
@@ -44,6 +45,9 @@ app.use('/v1/standings', apiKeyAuth, standingsRouter);
 
 // Live scores (from Bzzoiro). Also protected by API key.
 app.use('/v1/live', apiKeyAuth, liveRouter);
+
+// Bookmaker odds (consensus, from Bzzoiro). Also protected by API key.
+app.use('/v1/odds', apiKeyAuth, oddsRouter);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -16,12 +16,18 @@ const CACHE_SECONDS = 30;
 let cache = { events: null, fetchedAt: 0 };
 let inFlight = null; // if a fetch is already running, everyone waits for the same one
 
+// Bzzoiro's free Image API serves badges by id (no key needed).
+// If a team or league has no image it answers 204 (empty) — show a placeholder.
+const IMG = 'https://sports.bzzoiro.com/img';
+const teamLogo = (id) => (id ? `${IMG}/team/${id}/` : null);
+const leagueLogo = (id) => (id ? `${IMG}/league/${id}/` : null);
+
 function mapEvent(e) {
   return {
     id: e.id,
-    league: { id: e.league_id ?? null, name: e.league_name ?? null },
-    home: { id: e.home_team_id ?? null, name: e.home_team ?? null },
-    away: { id: e.away_team_id ?? null, name: e.away_team ?? null },
+    league: { id: e.league_id ?? null, name: e.league_name ?? null, logo: leagueLogo(e.league_id) },
+    home: { id: e.home_team_id ?? null, name: e.home_team ?? null, logo: teamLogo(e.home_team_id) },
+    away: { id: e.away_team_id ?? null, name: e.away_team ?? null, logo: teamLogo(e.away_team_id) },
     kickoff: e.event_date ?? null,
     status: e.status ?? null,
     period: e.period ?? null,
