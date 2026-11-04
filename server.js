@@ -1,5 +1,5 @@
-// server.js — Step 1: basic server, proves the deploy works.
-// Later steps add: database caching, data fetch jobs, prediction logic, API keys.
+// server.js — odds-api
+// Fixtures + predictions + standings, all served from our own database.
 
 require('dotenv').config();
 require('./lib/fixDns'); // fixes "fetch failed" on some Windows/ISP networks
@@ -7,7 +7,9 @@ const express = require('express');
 const cors = require('cors');
 const fixturesRouter = require('./routes/fixtures');
 const predictRouter = require('./routes/predict');
+const standingsRouter = require('./routes/standings');
 const fetchAndStoreFixtures = require('./jobs/fetchFixtures');
+const fetchAndStoreStandings = require('./jobs/fetchStandings');
 const apiKeyAuth = require('./lib/apiKeyAuth');
 
 const app = express();
@@ -36,13 +38,33 @@ app.use('/v1/fixtures', fixturesRouter);
 // Protected by API key: every call must send a valid x-api-key header.
 app.use('/v1/predict', apiKeyAuth, predictRouter);
 
+// League tables. Also protected by API key.
+app.use('/v1/standings', apiKeyAuth, standingsRouter);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Fixtures first, then a one-minute pause, then standings.
+// The pause keeps us under football-data.org's 10-calls-per-minute limit.
+async function refreshAll() {
+  try {
+    await fetchAndStoreFixtures();
+  } catch (err) {
+    console.error('Fixtures fetch failed:', err.message);
+  }
+
+  await sleep(65 * 1000);
+
+  try {
+    await fetchAndStoreStandings();
+  } catch (err) {
+    console.error('Standings fetch failed:', err.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`odds-api listening on port ${PORT}`);
 
-  // Fetch fixtures once on startup, then every 6 hours.
-  // This is what keeps us from hitting football-data.org on every user request.
-  fetchAndStoreFixtures().catch((err) => console.error('Initial fetch failed:', err.message));
-  setInterval(() => {
-    fetchAndStoreFixtures().catch((err) => console.error('Scheduled fetch failed:', err.message));
-  }, 6 * 60 * 60 * 1000); // 6 hours
+  // Fetch once on startup, then every 6 hours.
+  refreshAll();
+  setInterval(refreshAll, 6 * 60 * 60 * 1000); // 6 hours
 });
