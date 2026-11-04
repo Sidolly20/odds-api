@@ -23,13 +23,15 @@ const idOf = (v) => (v && typeof v === 'object' ? v.id ?? null : null);
 function mapEvent(e, odds) {
   const homeId = e.home_team_id ?? idOf(e.home_team) ?? idOf(e.home);
   const awayId = e.away_team_id ?? idOf(e.away_team) ?? idOf(e.away);
-  const leagueId = e.league_id ?? idOf(e.league);
+  const leagueId = e.league_id ?? idOf(e.league) ?? idOf(e.competition) ?? idOf(e.tournament);
 
   return {
     id: e.id,
     league: {
       id: leagueId ?? null,
-      name: e.league_name ?? nameOf(e.league),
+      name:
+        e.league_name ?? nameOf(e.league) ?? e.competition_name ?? nameOf(e.competition) ??
+        e.tournament_name ?? nameOf(e.tournament) ?? null,
       logo: leagueLogo(leagueId)
     },
     home: {
@@ -93,45 +95,87 @@ async function oddsFor(ids) {
   return out;
 }
 
+// Dates are handled in UTC, as YYYY-MM-DD.
+const today = () => new Date().toISOString().slice(0, 10);
+const addDays = (ymd, n) => {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const kickoffOf = (e) => e.event_date ?? e.kickoff ?? e.start_time ?? null;
+
 // GET /v1/matches
+// Default window: today through the next 7 days, soonest first.
 // Optional: league_id, date_from, date_to (YYYY-MM-DD), team_name, limit (max 20), offset
+//           debug=1 adds one raw match from Bzzoiro (to check field names)
 router.get('/', async (req, res) => {
-  const params = new URLSearchParams();
-  params.set('status', 'upcoming');
+  const base = new URLSearchParams();
+  base.set('status', 'upcoming');
 
   if (req.query.league_id) {
     const n = parseInt(req.query.league_id);
     if (!Number.isInteger(n)) return res.status(400).json({ error: 'league_id must be a number.' });
-    params.set('league_id', String(n));
+    base.set('league_id', String(n));
   }
+
   for (const name of ['date_from', 'date_to']) {
-    if (req.query[name]) {
-      if (!DATE_RE.test(req.query[name])) {
-        return res.status(400).json({ error: `${name} must look like 2026-11-05.` });
-      }
-      params.set(name, req.query[name]);
+    if (req.query[name] && !DATE_RE.test(req.query[name])) {
+      return res.status(400).json({ error: `${name} must look like 2026-11-05.` });
     }
   }
-  if (req.query.team_name) params.set('team_name', String(req.query.team_name).slice(0, 60));
+  const dateFrom = req.query.date_from || today();
+  const dateTo = req.query.date_to || addDays(dateFrom, 7);
+  base.set('date_from', dateFrom);
+  base.set('date_to', dateTo);
+
+  if (req.query.team_name) base.set('team_name', String(req.query.team_name).slice(0, 60));
 
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 20);
   const offset = Math.max(parseInt(req.query.offset) || 0, 0);
-  params.set('limit', String(limit));
-  params.set('offset', String(offset));
-  params.sort();
+
+  const pathFor = (off, lim) => {
+    const p = new URLSearchParams(base);
+    p.set('limit', String(lim));
+    p.set('offset', String(off));
+    p.sort();
+    return `/events/?${p.toString()}`;
+  };
+  const listOf = (data) => (Array.isArray(data) ? data : (data.results ?? data.events ?? []));
 
   try {
-    const { data, stale } = await bzzGet(`/events/?${params.toString()}`, 60);
-    const list = Array.isArray(data) ? data : (data.results ?? data.events ?? []);
+    let { data, stale } = await bzzGet(pathFor(offset, limit), 60);
+    let list = listOf(data);
+    const total = data.count ?? list.length;
+
+    // Bzzoiro may return the LATEST matches first. We want the SOONEST first,
+    // so if the page comes back newest-first, fetch the other end instead.
+    const newestFirst =
+      list.length > 1 && String(kickoffOf(list[0])) > String(kickoffOf(list[list.length - 1]));
+    if (newestFirst && total > limit) {
+      const start = Math.max(0, total - offset - limit);
+      const len = Math.min(limit, total - offset);
+      if (len > 0) {
+        const second = await bzzGet(pathFor(start, len), 60);
+        list = listOf(second.data);
+        stale = stale || second.stale;
+      } else {
+        list = [];
+      }
+    }
+    list = [...list].sort((a, b) => String(kickoffOf(a)).localeCompare(String(kickoffOf(b))));
+
     const oddsMap = await oddsFor(list.map((e) => e.id).filter(Boolean));
 
-    res.json({
-      count: data.count ?? list.length,
+    const body = {
+      count: total,
+      window: { from: dateFrom, to: dateTo },
       limit,
       offset,
       stale,
       matches: list.map((e) => mapEvent(e, oddsMap.get(e.id)))
-    });
+    };
+    if (req.query.debug === '1' && list[0]) body.raw_first_event = list[0];
+    res.json(body);
   } catch (err) {
     if (err instanceof UpstreamError && err.status === 400) {
       return res.status(400).json(err.body || { error: 'Invalid request.' });
