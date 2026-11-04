@@ -35,8 +35,9 @@ app.get('/v1/ping', (req, res) => {
   res.json({ pong: true });
 });
 
-// Real data, served from our own database, never live from football-data.org
-app.use('/v1/fixtures', fixturesRouter);
+// Real data, served from our own database, never live from football-data.org.
+// Protected by API key: every call must send a valid x-api-key header.
+app.use('/v1/fixtures', apiKeyAuth, fixturesRouter);
 
 // The core product — win/draw/away probability for a given fixture.
 // Protected by API key: every call must send a valid x-api-key header.
