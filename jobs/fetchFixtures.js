@@ -2,6 +2,9 @@
 // and stores them in Supabase. This runs on a timer (every few hours),
 // NOT on every API request — that's what keeps us from hitting the
 // free tier's rate limit and getting banned.
+//
+// UPDATE: now also saves team logos, the competition logo, and the
+// team / competition ids that football-data.org already sends with each match.
 
 // Load .env FIRST if this file is run directly, before anything else
 // reads process.env (lib/supabase.js reads it as soon as it's required).
@@ -37,8 +40,14 @@ function mapMatchToRow(match) {
   return {
     id: match.id,
     competition: match.competition?.name || null,
+    competition_code: match.competition?.code || null,
+    competition_emblem: match.competition?.emblem || null,
     home_team: match.homeTeam?.name || null,
     away_team: match.awayTeam?.name || null,
+    home_team_id: match.homeTeam?.id ?? null,
+    away_team_id: match.awayTeam?.id ?? null,
+    home_crest: match.homeTeam?.crest || null,
+    away_crest: match.awayTeam?.crest || null,
     utc_date: match.utcDate,
     status: match.status,
     home_score: match.score?.fullTime?.home ?? null,
