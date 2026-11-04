@@ -10,6 +10,7 @@ const predictRouter = require('./routes/predict');
 const standingsRouter = require('./routes/standings');
 const liveRouter = require('./routes/live');
 const oddsRouter = require('./routes/odds');
+const matchesRouter = require('./routes/matches');
 const fetchAndStoreFixtures = require('./jobs/fetchFixtures');
 const fetchAndStoreStandings = require('./jobs/fetchStandings');
 const apiKeyAuth = require('./lib/apiKeyAuth');
@@ -48,6 +49,9 @@ app.use('/v1/live', apiKeyAuth, liveRouter);
 
 // Bookmaker odds (consensus, from Bzzoiro). Also protected by API key.
 app.use('/v1/odds', apiKeyAuth, oddsRouter);
+
+// Upcoming matches with badges and odds in one call. Also protected by API key.
+app.use('/v1/matches', apiKeyAuth, matchesRouter);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
