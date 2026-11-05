@@ -70,20 +70,74 @@ async function collectUpcoming(base, needed, keepAll) {
 }
 
 // Odds + prediction for a page of matches, a few at a time (never a burst).
-async function enrich(ids) {
+//
+// Saving: the last good odds/prediction are stored in Supabase (table
+// match_extras). Far-away matches are re-fetched rarely; matches kicking off
+// soon refresh often. If Bzzoiro fails, the saved copy is shown instead.
+const supabase = require('../lib/supabase');
+const lastSaved = new Map(); // id -> time we last wrote it (limits database writes)
+
+function ttlFor(e, near, mid, far) {
+  const hrs = (new Date(S.kickoffOf(e)).getTime() - Date.now()) / 3600000;
+  if (!isFinite(hrs) || hrs <= 3) return near;
+  return hrs <= 24 ? mid : far;
+}
+
+async function loadSaved(ids) {
+  try {
+    const { data } = await supabase.from('match_extras').select('*').in('id', ids);
+    return new Map((data || []).map((r) => [r.id, r]));
+  } catch (err) {
+    return new Map(); // table missing or database down: carry on without it
+  }
+}
+
+async function enrich(events) {
   const out = new Map();
+  const saved = await loadSaved(events.map((e) => e.id));
+  const toSave = [];
   const CHUNK = 5;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const part = ids.slice(i, i + CHUNK);
+
+  for (let i = 0; i < events.length; i += CHUNK) {
     await Promise.all(
-      part.map(async (id) => {
-        const [odds, prediction] = await Promise.all([
-          bzzGetSafe(`/events/${id}/odds/`, 180),
-          bzzGetSafe(`/events/${id}/prediction/`, 120)
-        ]);
+      events.slice(i, i + CHUNK).map(async (e) => {
+        const id = e.id;
+        const old = saved.get(id);
+        const ageSec = old ? (Date.now() - new Date(old.updated_at).getTime()) / 1000 : Infinity;
+        const oddsTtl = ttlFor(e, 180, 900, 1800);
+        const predTtl = ttlFor(e, 120, 900, 1800);
+
+        // Saved copy still fresh enough -> no Bzzoiro call at all.
+        let odds = old && old.odds && ageSec < oddsTtl ? old.odds : null;
+        let prediction = old && old.prediction && ageSec < predTtl ? old.prediction : null;
+        let fetched = false;
+
+        if (!odds) {
+          odds = await bzzGetSafe(`/events/${id}/odds/`, oddsTtl);
+          if (odds) fetched = true;
+        }
+        if (!prediction) {
+          prediction = await bzzGetSafe(`/events/${id}/prediction/`, predTtl);
+          if (prediction) fetched = true;
+        }
+
+        // Bzzoiro had nothing -> fall back to whatever we saved earlier.
+        if (!odds && old) odds = old.odds;
+        if (!prediction && old) prediction = old.prediction;
+
         out.set(id, { odds, prediction });
+
+        if (fetched && (odds || prediction) && Date.now() - (lastSaved.get(id) || 0) > 5 * 60 * 1000) {
+          lastSaved.set(id, Date.now());
+          toSave.push({ id, odds, prediction, updated_at: new Date().toISOString() });
+        }
       })
     );
+  }
+
+  if (lastSaved.size > 5000) lastSaved.clear();
+  if (toSave.length) {
+    supabase.from('match_extras').upsert(toSave).then(() => { }).catch(() => { });
   }
   return out;
 }
@@ -122,7 +176,7 @@ router.get('/', async (req, res) => {
     const hasMore = kept.length > offset + limit || !exhausted;
 
     const [extras, names] = await Promise.all([
-      enrich(page.map((e) => e.id).filter(Boolean)),
+      enrich(page.filter((e) => e.id)),
       getLeagueNames()
     ]);
 
