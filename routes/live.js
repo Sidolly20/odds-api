@@ -9,6 +9,7 @@
 
 const express = require('express');
 const router = express.Router();
+const { fetchLiveBackup } = require('../lib/apiFootball');
 
 const BZZOIRO_URL = 'https://sports.bzzoiro.com/api/v2/events/live/?limit=200';
 const CACHE_SECONDS = 30;
@@ -66,7 +67,12 @@ async function getLiveEvents() {
   }
 
   if (!inFlight) {
+    // Try Bzzoiro first; if it fails, fall back to API-Football (if configured).
     inFlight = fetchFromBzzoiro()
+      .catch((err) => {
+        console.error('Bzzoiro live failed, trying backup:', err.message);
+        return fetchLiveBackup();
+      })
       .then((events) => {
         cache = { events, fetchedAt: Date.now() };
         return events;
