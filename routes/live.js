@@ -1,27 +1,27 @@
-// routes/live.js — live scores, powered by Bzzoiro Sports Data.
+// routes/live.js — live scores.
 //
-// Not stored in the database: live scores change every few seconds, so the
-// server keeps ONE shared copy in memory for 30 seconds. Every customer reads
-// that copy, so Bzzoiro is called at most about twice a minute no matter how
-// many people use this endpoint.
+// Source 1: Bzzoiro (same list address ZurePicks uses, through the shared polite client in lib/bzz.js).
+// Source 2: football-data.org (backup, big competitions only) when Bzzoiro cannot answer.
+// If both fail, we may serve our last copy for at most 2 minutes; after that we say "unavailable".
+// We never serve old scores as if they were live.
 //
-// Needs the environment variable BZZOIRO_KEY (set it on Render).
+// One shared copy is kept in memory for 30 seconds, so many visitors cost very few calls.
 
 const express = require('express');
 const router = express.Router();
-const { fetchLiveBackup } = require('../lib/apiFootball');
+const { bzzGet } = require('../lib/bzz');
+const { fetchFootballDataLive } = require('../lib/footballDataLive');
 
-const BZZOIRO_URL = 'https://sports.bzzoiro.com/api/v2/events/live/?limit=200';
 const CACHE_SECONDS = 30;
-// An old copy may only be served for this long if Bzzoiro is failing.
-// Older than this, live scores would be wrong (finished games shown as live), so we say "unavailable" instead.
 const MAX_STALE_SECONDS = 120;
 
-let cache = { events: null, fetchedAt: 0 };
+const day = (offset) => new Date(Date.now() + offset * 864e5).toISOString().slice(0, 10);
+const livePath = () => `/events/?status=live&date_from=${day(-1)}&date_to=${day(1)}&limit=200`;
+
+let cache = { events: null, fetchedAt: 0, source: null };
 let inFlight = null; // if a fetch is already running, everyone waits for the same one
 
 // Bzzoiro's free Image API serves badges by id (no key needed).
-// If a team or league has no image it answers 204 (empty) — show a placeholder.
 const IMG = 'https://sports.bzzoiro.com/img';
 const teamLogo = (id) => (id ? `${IMG}/team/${id}/` : null);
 const leagueLogo = (id) => (id ? `${IMG}/league/${id}/` : null);
@@ -40,45 +40,37 @@ function mapEvent(e) {
     halftime: { home: e.home_score_ht ?? null, away: e.away_score_ht ?? null },
     extra_time_score: e.extra_time_score ?? null,
     penalty_shootout: e.penalty_shootout ?? null,
-    last_updated: e.last_updated ?? null
+    last_updated: e.last_updated ?? null,
+    source: 'bzzoiro'
   };
 }
 
-async function fetchFromBzzoiro() {
-  const key = process.env.BZZOIRO_KEY;
-  if (!key) {
-    throw new Error('BZZOIRO_KEY is not set on the server.');
-  }
-
-  const res = await fetch(BZZOIRO_URL, {
-    headers: { Authorization: `Token ${key}` }
-  });
-
-  if (!res.ok) {
-    throw new Error(`Bzzoiro returned ${res.status}`);
-  }
-
-  const data = await res.json();
-  const list = data.events || data.results || [];
+async function fromBzzoiro() {
+  const { data } = await bzzGet(livePath(), CACHE_SECONDS, MAX_STALE_SECONDS);
+  const list = Array.isArray(data) ? data : data.events || data.results || [];
   return list.map(mapEvent);
+}
+
+async function loadLive() {
+  try {
+    return { events: await fromBzzoiro(), source: 'bzzoiro' };
+  } catch (err) {
+    console.error('Bzzoiro live failed, trying football-data:', err.message);
+    return { events: await fetchFootballDataLive(), source: 'football-data' };
+  }
 }
 
 async function getLiveEvents() {
   const age = (Date.now() - cache.fetchedAt) / 1000;
   if (cache.events && age < CACHE_SECONDS) {
-    return { events: cache.events, stale: false };
+    return { events: cache.events, stale: false, source: cache.source };
   }
 
   if (!inFlight) {
-    // Try Bzzoiro first; if it fails, fall back to API-Football (if configured).
-    inFlight = fetchFromBzzoiro()
-      .catch((err) => {
-        console.error('Bzzoiro live failed, trying backup:', err.message);
-        return fetchLiveBackup();
-      })
-      .then((events) => {
-        cache = { events, fetchedAt: Date.now() };
-        return events;
+    inFlight = loadLive()
+      .then((r) => {
+        cache = { events: r.events, fetchedAt: Date.now(), source: r.source };
+        return r;
       })
       .finally(() => {
         inFlight = null;
@@ -86,13 +78,12 @@ async function getLiveEvents() {
   }
 
   try {
-    const events = await inFlight;
-    return { events, stale: false };
+    const r = await inFlight;
+    return { events: r.events, stale: false, source: r.source };
   } catch (err) {
-    // If Bzzoiro fails we may serve the last copy, but only while it is still recent.
     const oldAge = (Date.now() - cache.fetchedAt) / 1000;
     if (cache.events && oldAge < MAX_STALE_SECONDS) {
-      return { events: cache.events, stale: true };
+      return { events: cache.events, stale: true, source: cache.source };
     }
     throw err;
   }
@@ -102,7 +93,7 @@ async function getLiveEvents() {
 // Optional: ?league_id=80 to see just one league
 router.get('/', async (req, res) => {
   try {
-    const { events, stale } = await getLiveEvents();
+    const { events, stale, source } = await getLiveEvents();
 
     let out = events;
     if (req.query.league_id) {
@@ -113,6 +104,7 @@ router.get('/', async (req, res) => {
     res.json({
       count: out.length,
       stale,
+      source,
       updated_at: new Date(cache.fetchedAt).toISOString(),
       matches: out
     });
