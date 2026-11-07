@@ -28,7 +28,7 @@ async function collectUpcoming(base, needed, keepAll) {
     return `/events/?${p.toString()}`;
   };
 
-  const first = await bzzGet(pathFor(0, PAGE), 60);
+  const first = await bzzGet(pathFor(0, PAGE), 180);
   let stale = first.stale;
   const firstList = S.listOf(first.data);
   const total = first.data.count ?? firstList.length;
@@ -57,7 +57,7 @@ async function collectUpcoming(base, needed, keepAll) {
     if (!newestFirst && k === 0) {
       list = firstList;
     } else {
-      const r = await bzzGet(pathFor(off, len), 60);
+      const r = await bzzGet(pathFor(off, len), 180);
       stale = stale || r.stale;
       list = S.listOf(r.data);
     }
@@ -104,8 +104,11 @@ async function enrich(events) {
         const id = e.id;
         const old = saved.get(id);
         const ageSec = old ? (Date.now() - new Date(old.updated_at).getTime()) / 1000 : Infinity;
-        const oddsTtl = ttlFor(e, 180, 900, 1800);
-        const predTtl = ttlFor(e, 120, 900, 1800);
+        // ONE shared time for odds and prediction (they are saved together with one timestamp,
+        // so two different times would leave one of them never refreshed).
+        // Kicking off within 3h: 10 min. Within a day: 30 min. Further away: 1 hour.
+        const oddsTtl = ttlFor(e, 600, 1800, 3600);
+        const predTtl = oddsTtl;
 
         // Saved copy still fresh enough -> no Bzzoiro call at all.
         let odds = old && old.odds && ageSec < oddsTtl ? old.odds : null;
@@ -211,8 +214,8 @@ router.get('/', async (req, res) => {
 
 // What ?include= can ask for, and how long each answer is kept.
 const INCLUDE = {
-  odds:       { path: (id) => `/events/${id}/odds/`,       ttl: 180 },
-  prediction: { path: (id) => `/events/${id}/prediction/`, ttl: 120 },
+  odds:       { path: (id) => `/events/${id}/odds/`,       ttl: 300 },
+  prediction: { path: (id) => `/events/${id}/prediction/`, ttl: 600 },
   h2h:        { path: (id) => `/events/${id}/h2h/`,        ttl: 3600 },
   lineups:    { path: (id) => `/events/${id}/lineups/`,    ttl: 60 },
   incidents:  { path: (id) => `/events/${id}/incidents/`,  ttl: 20 },
