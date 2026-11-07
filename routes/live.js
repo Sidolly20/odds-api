@@ -1,8 +1,10 @@
 // routes/live.js — live scores.
 //
-// Source 1: Bzzoiro (same list address ZurePicks uses, through the shared polite client in lib/bzz.js).
+// Source 1: Bzzoiro (through the shared polite client in lib/bzz.js).
 // Source 2: football-data.org (backup, big competitions only) when Bzzoiro cannot answer.
-// If both fail, we may serve our last copy for at most 3 minutes; after that we say "unavailable".
+// Source 3: ESPN scoreboard (backup, free, real clock for big leagues) when Bzzoiro cannot answer.
+// Source 4: Highlightly (last resort, budget-limited) when Bzzoiro cannot answer.
+// If everything fails, we may serve our last copy for at most 3 minutes; after that we say "unavailable".
 // We never serve old scores as if they were live.
 //
 // One shared copy is kept in memory for 60 seconds, so many visitors cost very few calls.
@@ -12,6 +14,7 @@ const router = express.Router();
 const { bzzGet, bzzState } = require('../lib/bzz');
 const { fetchFootballDataLive } = require('../lib/footballDataLive');
 const { fetchEspnLive } = require('../lib/espnLive');
+const { fetchHighlightlyLive, highlightlyState } = require('../lib/highlightly');
 
 // Same team = same name after dropping "FC", accents and punctuation.
 const nameKey = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -38,6 +41,17 @@ function mergeEspn(fd, es) {
     };
   });
   return merged.concat(es.filter((e) => !used.has(e.id)));
+}
+
+// Adds Highlightly matches that the other sources did not already list.
+function addMissing(base, extra) {
+  const out = base.slice();
+  for (const x of extra) {
+    const dup = out.some((b) => sameName(b.home.name, x.home.name) && sameName(b.away.name, x.away.name) &&
+      Math.abs(Date.parse(b.kickoff) - Date.parse(x.kickoff)) < 4 * 3600e3);
+    if (!dup) out.push(x);
+  }
+  return out;
 }
 
 // While matches are in play we ask every 60 s. While NOTHING is live we only ask every 90 s.
@@ -87,16 +101,47 @@ async function loadLive() {
   try {
     return { events: await fromBzzoiro(), source: 'bzzoiro', why: null, notes: null };
   } catch (err) {
-    console.error('Bzzoiro live failed, trying football-data and ESPN:', err.message);
+    console.error('Bzzoiro live failed, trying backups:', err.message);
+
     let fd = [];
     let fdErr = null;
     let es = [];
     let esErr = null;
     try { fd = await fetchFootballDataLive(); } catch (e) { fdErr = e.message; }
     try { es = await fetchEspnLive(); } catch (e) { esErr = e.message; }
-    if (fdErr && esErr) throw new Error(`football-data: ${fdErr}; ESPN: ${esErr}`);
-    const source = es.length ? (fd.length ? 'football-data+espn' : fdErr ? 'espn' : 'football-data+espn') : 'football-data';
-    return { events: mergeEspn(fd, es), source, why: err.message, notes: { football_data_error: fdErr, espn_error: esErr, espn_live: es.length } };
+
+    let events = mergeEspn(fd, es);
+
+    // Highlightly runs in this branch (Bzzoiro has failed). Its own limits decide whether it really calls.
+    let hl = null;
+    let hlErr = null;
+    try { hl = await fetchHighlightlyLive(); events = addMissing(events, hl.events); } catch (e) { hlErr = e.message; }
+
+    const hlUsed = hl && hl.events.length ? 'highlightly' : null;
+    if (fdErr && esErr && !hlUsed) {
+      throw new Error(`football-data: ${fdErr}; ESPN: ${esErr}; Highlightly: ${hlErr}`);
+    }
+
+    const parts = [];
+    if (fd.length) parts.push('football-data');
+    if (es.length) parts.push('espn');
+    if (hlUsed) parts.push(hlUsed);
+    const source = parts.join('+') || 'none';
+
+    return {
+      events,
+      source,
+      why: err.message,
+      notes: {
+        football_data_error: fdErr,
+        espn_error: esErr,
+        espn_live: es.length,
+        highlightly_error: hlErr,
+        highlightly_live: hl ? hl.events.length : 0,
+        highlightly_as_of: hl ? hl.as_of : null,
+        highlightly: highlightlyState()
+      }
+    };
   }
 }
 
