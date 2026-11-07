@@ -13,6 +13,9 @@ const { fetchLiveBackup } = require('../lib/apiFootball');
 
 const BZZOIRO_URL = 'https://sports.bzzoiro.com/api/v2/events/live/?limit=200';
 const CACHE_SECONDS = 30;
+// An old copy may only be served for this long if Bzzoiro is failing.
+// Older than this, live scores would be wrong (finished games shown as live), so we say "unavailable" instead.
+const MAX_STALE_SECONDS = 120;
 
 let cache = { events: null, fetchedAt: 0 };
 let inFlight = null; // if a fetch is already running, everyone waits for the same one
@@ -86,8 +89,9 @@ async function getLiveEvents() {
     const events = await inFlight;
     return { events, stale: false };
   } catch (err) {
-    // If Bzzoiro fails but we have an older copy, serve it and say so.
-    if (cache.events) {
+    // If Bzzoiro fails we may serve the last copy, but only while it is still recent.
+    const oldAge = (Date.now() - cache.fetchedAt) / 1000;
+    if (cache.events && oldAge < MAX_STALE_SECONDS) {
       return { events: cache.events, stale: true };
     }
     throw err;
