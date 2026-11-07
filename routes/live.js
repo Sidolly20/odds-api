@@ -11,6 +11,34 @@ const express = require('express');
 const router = express.Router();
 const { bzzGet, bzzState } = require('../lib/bzz');
 const { fetchFootballDataLive } = require('../lib/footballDataLive');
+const { fetchEspnLive } = require('../lib/espnLive');
+
+// Same team = same name after dropping "FC", accents and punctuation.
+const nameKey = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/\b(fc|afc|cf|sc|ac|as|fk|sk|cd|ud|club|de|the)\b/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+const sameName = (a, b) => { a = nameKey(a); b = nameKey(b); return !!a && !!b && (a === b || a.includes(b) || b.includes(a)); };
+
+// football-data gives scores but no minute. ESPN gives a real clock. Where both list the same match
+// (both team names agree, kick-offs within 4 hours) we keep football-data's id and take ESPN's clock.
+// Matches only ESPN has are added as they are.
+function mergeEspn(fd, es) {
+  const used = new Set();
+  const merged = fd.map((f) => {
+    const hit = es.find((e) => !used.has(e.id) && sameName(e.home.name, f.home.name) && sameName(e.away.name, f.away.name) &&
+      Math.abs(Date.parse(e.kickoff) - Date.parse(f.kickoff)) < 4 * 3600e3);
+    if (!hit) return f;
+    used.add(hit.id);
+    return {
+      ...f,
+      status: hit.status,
+      period: hit.period,
+      minute: hit.minute ?? f.minute,
+      minute_estimated: hit.minute == null ? f.minute_estimated : false,
+      score: hit.score.home != null && hit.score.away != null ? hit.score : f.score
+    };
+  });
+  return merged.concat(es.filter((e) => !used.has(e.id)));
+}
 
 // While matches are in play we ask every 60 s. While NOTHING is live we only ask every 90 s.
 // (Change with LIVE_CACHE_SECONDS / LIVE_IDLE_SECONDS on Render if you ever need to.)
@@ -22,7 +50,7 @@ const cacheSeconds = () => (cache.events && cache.events.length === 0 ? IDLE_SEC
 const day = (offset) => new Date(Date.now() + offset * 864e5).toISOString().slice(0, 10);
 const livePath = () => `/events/?status=live&date_from=${day(-1)}&date_to=${day(1)}&limit=200`;
 
-let cache = { events: null, fetchedAt: 0, source: null, why: null };
+let cache = { events: null, fetchedAt: 0, source: null, why: null, notes: null };
 let inFlight = null; // if a fetch is already running, everyone waits for the same one
 
 // Bzzoiro's free Image API serves badges by id (no key needed).
@@ -57,10 +85,18 @@ async function fromBzzoiro() {
 
 async function loadLive() {
   try {
-    return { events: await fromBzzoiro(), source: 'bzzoiro', why: null };
+    return { events: await fromBzzoiro(), source: 'bzzoiro', why: null, notes: null };
   } catch (err) {
-    console.error('Bzzoiro live failed, trying football-data:', err.message);
-    return { events: await fetchFootballDataLive(), source: 'football-data', why: err.message };
+    console.error('Bzzoiro live failed, trying football-data and ESPN:', err.message);
+    let fd = [];
+    let fdErr = null;
+    let es = [];
+    let esErr = null;
+    try { fd = await fetchFootballDataLive(); } catch (e) { fdErr = e.message; }
+    try { es = await fetchEspnLive(); } catch (e) { esErr = e.message; }
+    if (fdErr && esErr) throw new Error(`football-data: ${fdErr}; ESPN: ${esErr}`);
+    const source = es.length ? (fd.length ? 'football-data+espn' : fdErr ? 'espn' : 'football-data+espn') : 'football-data';
+    return { events: mergeEspn(fd, es), source, why: err.message, notes: { football_data_error: fdErr, espn_error: esErr, espn_live: es.length } };
   }
 }
 
@@ -73,7 +109,7 @@ async function getLiveEvents() {
   if (!inFlight) {
     inFlight = loadLive()
       .then((r) => {
-        cache = { events: r.events, fetchedAt: Date.now(), source: r.source, why: r.why };
+        cache = { events: r.events, fetchedAt: Date.now(), source: r.source, why: r.why, notes: r.notes };
         return r;
       })
       .finally(() => {
@@ -114,6 +150,7 @@ router.get('/', async (req, res) => {
       diag: {
         source,
         bzzoiro_failed_because: cache.why,
+        backups: cache.notes,
         bzzoiro: bzzState(),
         live_count: events.length,
         with_score: events.filter((e) => e.score && e.score.home != null && e.score.away != null).length,
