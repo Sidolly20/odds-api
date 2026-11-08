@@ -91,10 +91,28 @@ function mapEvent(e) {
   };
 }
 
+// Trust each match's OWN status, not which list it came from. Bzzoiro's status=live list
+// can include games that have not started yet, and it is capped at 200 per page.
+const NOT_PLAYING = ['notstarted', 'upcoming', 'scheduled', 'timed', 'finished', 'ended', 'fulltime',
+  'afterextra', 'afterpen', 'postpone', 'cancel', 'abandon', 'suspend', 'interrupt'];
+function inPlay(e) {
+  const s = String(e.status || '').toLowerCase().replace(/[^a-z]/g, '');
+  const p = String(e.period || '').toUpperCase();
+  if (!s || s === 'ft') return ['1H', '2H', 'HT', 'ET'].includes(p);
+  if (NOT_PLAYING.some((w) => s.includes(w))) return false;
+  return true;
+}
+
 async function fromBzzoiro() {
-  const { data } = await bzzGet(livePath(), cacheSeconds(), MAX_STALE_SECONDS);
-  const list = Array.isArray(data) ? data : data.events || data.results || [];
-  return list.map(mapEvent);
+  const seen = new Map();
+  for (let off = 0; off < 1000; off += 200) {
+    const path = `${livePath()}&offset=${off}`;
+    const { data } = await bzzGet(path, cacheSeconds(), MAX_STALE_SECONDS);
+    const list = Array.isArray(data) ? data : data.events || data.results || [];
+    for (const e of list) seen.set(e.id, e);
+    if (list.length < 200) break;
+  }
+  return [...seen.values()].filter(inPlay).map(mapEvent);
 }
 
 async function loadLive() {
